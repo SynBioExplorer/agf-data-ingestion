@@ -1,0 +1,52 @@
+{
+  "rules": [
+    {
+      "Name": "agf-run-json-trigger-dev",
+      "Description": "Trigger Lambda when run.json is uploaded to S3",
+      "State": "ENABLED",
+      "EventBusName": "default",
+      "EventPattern": {
+        "source": ["aws.s3"],
+        "detail-type": ["Object Created"],
+        "detail": {
+          "bucket": {
+            "name": ["agf-instrument-data"]
+          },
+          "object": {
+            "key": [{"suffix": "run.json"}]
+          }
+        }
+      },
+      "Targets": [
+        {
+          "Id": "IngestionLambdaTarget",
+          "Arn": "arn:aws:lambda:ap-southeast-2:789922127765:function:agf-data-ingestion-dev"
+        }
+      ]
+    },
+    {
+      "Name": "agf-experiment-json-trigger-dev",
+      "Description": "Trigger Lambda when experiment.json is uploaded to S3",
+      "State": "ENABLED",
+      "EventBusName": "default",
+      "EventPattern": {
+        "source": ["aws.s3"],
+        "detail-type": ["Object Created"],
+        "detail": {
+          "bucket": {
+            "name": ["agf-instrument-data"]
+          },
+          "object": {
+            "key": [{"suffix": "experiment.json"}]
+          }
+        }
+      },
+      "Targets": [
+        {
+          "Id": "IngestionLambdaTarget",
+          "Arn": "arn:aws:lambda:ap-southeast-2:789922127765:function:agf-data-ingestion-dev"
+        }
+      ]
+    }
+  ]
+}

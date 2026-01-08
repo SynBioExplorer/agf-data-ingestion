@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AGF Data Infrastructure - Lambda Function for S3 to DynamoDB Ingestion'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (must match DynamoDB stack)
+  
+  S3BucketName:
+    Type: String
+    Default: 'agf-instrument-data'
+    Description: S3 bucket containing instrument data
+  
+  DynamoDBStackName:
+    Type: String
+    Default: 'agf-dynamodb-stack'
+    Description: Name of the DynamoDB CloudFormation stack
+
+Resources:
+  # ============================================================================
+  # Lambda Execution Role
+  # ============================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'agf-ingestion-lambda-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+        
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - Fn::ImportValue: !Sub '${DynamoDBStackName}-FileInventoryTableArn'
+                  - Fn::ImportValue: !Sub '${DynamoDBStackName}-ExperimentsTableArn'
+                  - Fn::ImportValue: !Sub '${DynamoDBStackName}-SyncRunsTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn: 
+                        Fn::ImportValue: !Sub '${DynamoDBStackName}-FileInventoryTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn: 
+                        Fn::ImportValue: !Sub '${DynamoDBStackName}-ExperimentsTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn: 
+                        Fn::ImportValue: !Sub '${DynamoDBStackName}-SyncRunsTableArn'
+
+  # ============================================================================
+  # Lambda Function
+  # ============================================================================
+  IngestionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'agf-data-ingestion-${EnvironmentName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300  # 5 minutes
+      MemorySize: 512  # MB
+      Environment:
+        Variables:
+          FILE_INVENTORY_TABLE:
+            Fn::ImportValue: !Sub '${DynamoDBStackName}-FileInventoryTable'
+          EXPERIMENTS_TABLE:
+            Fn::ImportValue: !Sub '${DynamoDBStackName}-ExperimentsTable'
+          SYNC_RUNS_TABLE:
+            Fn::ImportValue: !Sub '${DynamoDBStackName}-SyncRunsTable'
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Placeholder')}
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # EventBridge Rule for run.json files
+  # ============================================================================
+  RunJsonEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'agf-run-json-trigger-${EnvironmentName}'
+      Description: Trigger Lambda when run.json is uploaded to S3
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref S3BucketName
+          object:
+            key:
+              - suffix: run.json
+      Targets:
+        - Arn: !GetAtt IngestionLambdaFunction.Arn
+          Id: IngestionLambdaTarget
+
+  # ============================================================================
+  # EventBridge Rule for experiment.json files
+  # ============================================================================
+  ExperimentJsonEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'agf-experiment-json-trigger-${EnvironmentName}'
+      Description: Trigger Lambda when experiment.json is uploaded to S3
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref S3BucketName
+          object:
+            key:
+              - suffix: experiment.json
+      Targets:
+        - Arn: !GetAtt IngestionLambdaFunction.Arn
+          Id: IngestionLambdaTarget
+
+  # ============================================================================
+  # Lambda Permissions for EventBridge
+  # ============================================================================
+  RunJsonEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestionLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RunJsonEventRule.Arn
+
+  ExperimentJsonEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestionLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExperimentJsonEventRule.Arn
+
+  # ============================================================================
+  # S3 EventBridge Notification Configuration
+  # Note: This requires the S3 bucket to have EventBridge enabled
+  # You may need to enable this manually in the console
+  # ============================================================================
+
+  # ============================================================================
+  # Zip Generator Lambda - On-demand zip file creation for bulk downloads
+  # ============================================================================
+  ZipGeneratorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'agf-zip-generator-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  ZipGeneratorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'agf-zip-generator-${EnvironmentName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ZipGeneratorLambdaRole.Arn
+      Timeout: 300  # 5 minutes
+      MemorySize: 1024  # 1GB for zip operations
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          # Placeholder - will be replaced with actual code
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Placeholder')}
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the ingestion Lambda function
+    Value: !GetAtt IngestionLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaFunctionName:
+    Description: Name of the ingestion Lambda function
+    Value: !Ref IngestionLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  RunJsonEventRuleName:
+    Description: Name of the run.json EventBridge rule
+    Value: !Ref RunJsonEventRule
+
+  ExperimentJsonEventRuleName:
+    Description: Name of the experiment.json EventBridge rule
+    Value: !Ref ExperimentJsonEventRule
+
+  ZipGeneratorLambdaArn:
+    Description: ARN of the zip generator Lambda function
+    Value: !GetAtt ZipGeneratorLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ZipGeneratorLambdaArn'
+
+  ZipGeneratorLambdaName:
+    Description: Name of the zip generator Lambda function
+    Value: !Ref ZipGeneratorLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ZipGeneratorLambdaName'
