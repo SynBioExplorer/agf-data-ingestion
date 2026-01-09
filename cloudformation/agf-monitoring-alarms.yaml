@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AGF Data Infrastructure - CloudWatch Alarms and SNS Notifications for Pipeline Monitoring'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev/staging/prod)
+
+  AlertEmail:
+    Type: String
+    Default: 'felix.meier@mq.edu.au'
+    Description: Email address for alert notifications
+
+  LambdaFunctionName:
+    Type: String
+    Default: 'agf-data-ingestion-dev'
+    Description: Name of the Lambda function to monitor
+
+Resources:
+  # ============================================================================
+  # SNS Topic for Alerts
+  # ============================================================================
+  AGFAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'agf-pipeline-alerts-${EnvironmentName}'
+      DisplayName: 'AGF Pipeline Alerts'
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AGFAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AGFAlertsTopic
+      Endpoint: !Ref AlertEmail
+
+  # ============================================================================
+  # CloudWatch Alarms
+  # ============================================================================
+
+  # Alarm 1: Lambda Errors
+  # Triggers when any Lambda invocation results in an error
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AGF-Lambda-Errors-${EnvironmentName}'
+      AlarmDescription: 'Triggered when the AGF ingestion Lambda function encounters errors'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Errors'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AGFAlertsTopic
+      OKActions:
+        - !Ref AGFAlertsTopic
+
+  # Alarm 2: Lambda Duration (approaching timeout)
+  # Triggers when Lambda execution time approaches the 300s timeout
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AGF-Lambda-Duration-${EnvironmentName}'
+      AlarmDescription: 'Triggered when Lambda execution time approaches timeout (>250s of 300s limit)'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Duration'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Maximum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 250000  # 250 seconds in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AGFAlertsTopic
+
+  # Alarm 3: DynamoDB Throttled Requests
+  # Triggers when DynamoDB throttles any requests
+  DynamoDBThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AGF-DynamoDB-Throttles-${EnvironmentName}'
+      AlarmDescription: 'Triggered when DynamoDB throttles requests on AGF tables'
+      Namespace: 'AWS/DynamoDB'
+      MetricName: 'ThrottledRequests'
+      Dimensions:
+        - Name: TableName
+          Value: !Sub 'agf-file-inventory-${EnvironmentName}'
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AGFAlertsTopic
+
+  # Alarm 4: Lambda Throttles
+  # Triggers when Lambda is being throttled
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AGF-Lambda-Throttles-${EnvironmentName}'
+      AlarmDescription: 'Triggered when Lambda function is throttled'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'Throttles'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AGFAlertsTopic
+
+  # Alarm 5: Lambda Concurrent Executions (nearing limit)
+  # Triggers when concurrent executions approach the limit
+  LambdaConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'AGF-Lambda-Concurrency-${EnvironmentName}'
+      AlarmDescription: 'Triggered when Lambda concurrent executions are high'
+      Namespace: 'AWS/Lambda'
+      MetricName: 'ConcurrentExecutions'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LambdaFunctionName
+      Statistic: Maximum
+      Period: 60  # 1 minute
+      EvaluationPeriods: 5
+      Threshold: 10  # Alert if more than 10 concurrent executions
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AGFAlertsTopic
+
+Outputs:
+  AlertsTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref AGFAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopicArn'
+
+  AlertsTopicName:
+    Description: Name of the SNS topic for alerts
+    Value: !GetAtt AGFAlertsTopic.TopicName
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopicName'
+
+  LambdaErrorsAlarmArn:
+    Description: ARN of the Lambda errors alarm
+    Value: !GetAtt LambdaErrorsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaErrorsAlarmArn'

@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AGF Data Infrastructure - S3-DynamoDB Reconciliation Lambda and Scheduled Trigger'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'dev'
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name (dev/staging/prod)
+
+  AlertEmail:
+    Type: String
+    Default: 'felix.meier@mq.edu.au'
+    Description: Email address for reconciliation reports
+
+  DataBucketName:
+    Type: String
+    Default: 'agf-instrument-data'
+    Description: Name of the S3 bucket containing instrument data
+
+  AlertsTopicArn:
+    Type: String
+    Description: ARN of the SNS topic for alerts (from monitoring stack)
+    Default: ''
+
+Resources:
+  # ============================================================================
+  # IAM Role for Reconciliation Lambda
+  # ============================================================================
+  ReconciliationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'agf-reconciliation-lambda-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-file-inventory-${EnvironmentName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-file-inventory-${EnvironmentName}/index/*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # Reconciliation Lambda Function
+  # ============================================================================
+  ReconciliationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'agf-reconciliation-${EnvironmentName}'
+      Description: 'Weekly S3-DynamoDB reconciliation for AGF data pipeline'
+      Runtime: python3.11
+      Handler: agf_reconciliation_lambda.lambda_handler
+      Role: !GetAtt ReconciliationLambdaRole.Arn
+      Timeout: 900  # 15 minutes - may need to scan large S3 bucket
+      MemorySize: 512
+      Environment:
+        Variables:
+          FILE_INVENTORY_TABLE: !Sub 'agf-file-inventory-${EnvironmentName}'
+          DATA_BUCKET: !Ref DataBucketName
+          ALERT_EMAIL: !Ref AlertEmail
+          SNS_TOPIC_ARN: !Ref AlertsTopicArn
+      Code:
+        ZipFile: |
+          # Placeholder - deploy actual code from agf_reconciliation_lambda.py
+          def lambda_handler(event, context):
+              print("Deploy actual reconciliation code")
+              return {'statusCode': 200}
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ============================================================================
+  # CloudWatch Events Rule (Weekly Schedule)
+  # ============================================================================
+  ReconciliationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'agf-reconciliation-schedule-${EnvironmentName}'
+      Description: 'Triggers weekly S3-DynamoDB reconciliation every Sunday at 2 AM AEST'
+      ScheduleExpression: 'cron(0 16 ? * SUN *)'  # 16:00 UTC = 02:00 AEST (next day)
+      State: ENABLED
+      Targets:
+        - Id: ReconciliationLambdaTarget
+          Arn: !GetAtt ReconciliationLambda.Arn
+
+  ReconciliationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReconciliationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconciliationScheduleRule.Arn
+
+  # ============================================================================
+  # CloudWatch Log Group (with retention)
+  # ============================================================================
+  ReconciliationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/agf-reconciliation-${EnvironmentName}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  ReconciliationLambdaArn:
+    Description: ARN of the reconciliation Lambda function
+    Value: !GetAtt ReconciliationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReconciliationLambdaArn'
+
+  ReconciliationLambdaName:
+    Description: Name of the reconciliation Lambda function
+    Value: !Ref ReconciliationLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-ReconciliationLambdaName'
+
+  ReconciliationScheduleRuleArn:
+    Description: ARN of the weekly schedule rule
+    Value: !GetAtt ReconciliationScheduleRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReconciliationScheduleRuleArn'

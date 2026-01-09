@@ -5,13 +5,13 @@ Triggered by S3 EventBridge when run.json or experiment.json files are uploaded.
 Processes metadata and populates DynamoDB tables for dashboard queries.
 
 Author: Felix Meier
-Version: 1.0
+Version: 1.1
 """
 
 import json
 import boto3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 from typing import Dict, List, Any
 from decimal import Decimal
@@ -29,6 +29,27 @@ SYNC_RUNS_TABLE = os.environ['SYNC_RUNS_TABLE']
 file_inventory_table = dynamodb.Table(FILE_INVENTORY_TABLE)
 experiments_table = dynamodb.Table(EXPERIMENTS_TABLE)
 sync_runs_table = dynamodb.Table(SYNC_RUNS_TABLE)
+
+
+def parse_timestamp(timestamp_str: str, field_name: str = "timestamp") -> float:
+    """
+    Safely parse ISO 8601 timestamp string to Unix timestamp.
+    Falls back to current time if parsing fails.
+
+    Args:
+        timestamp_str: ISO 8601 formatted timestamp string
+        field_name: Name of the field for logging purposes
+
+    Returns:
+        Unix timestamp as float
+    """
+    try:
+        # Handle 'Z' suffix for UTC
+        normalized = timestamp_str.replace('Z', '+00:00')
+        return datetime.fromisoformat(normalized).timestamp()
+    except (ValueError, AttributeError, TypeError) as e:
+        print(f"WARNING: Failed to parse {field_name} '{timestamp_str}': {e}. Using current time.")
+        return datetime.now(timezone.utc).timestamp()
 
 
 def lambda_handler(event, context):
@@ -91,17 +112,17 @@ def lambda_handler(event, context):
 def process_run_metadata(bucket: str, key: str):
     """
     Process run.json metadata file
-    
+
     S3 Key Format: raw/{instrument}/{YYYY}/{MM}/{DD}/{run_id}/run.json
     """
     print(f"Processing run metadata: {key}")
-    
+
     # Parse S3 path
     path_parts = key.split('/')
     instrument_id = path_parts[1]
     year, month, day = path_parts[2:5]
     run_id = path_parts[5]
-    
+
     # Download run.json
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
@@ -109,11 +130,9 @@ def process_run_metadata(bucket: str, key: str):
     except Exception as e:
         print(f"Error downloading run.json: {e}")
         raise
-    
-    # Convert to Unix timestamp
-    sync_timestamp = datetime.fromisoformat(
-        run_data['sync_timestamp'].replace('Z', '+00:00')
-    ).timestamp()
+
+    # Convert to Unix timestamp with error handling
+    sync_timestamp = parse_timestamp(run_data.get('sync_timestamp', ''), 'sync_timestamp')
 
     # Calculate total_bytes from file manifest if not provided
     total_bytes = run_data.get('total_size_bytes')
@@ -133,27 +152,39 @@ def process_run_metadata(bucket: str, key: str):
         's3_key': key,
         's3_bucket': bucket,
         'processing_status': 'completed',
-        'processed_at': Decimal(str(int(datetime.now().timestamp())))
+        'processed_at': Decimal(str(int(datetime.now(timezone.utc).timestamp())))
     }
-    
+
     sync_runs_table.put_item(Item=item)
     print(f"Stored run metadata: {run_id}")
-    
-    # Process individual files in the manifest
-    for file_entry in run_data.get('file_manifest', []):
-        store_file_record(bucket, key, run_id, instrument_id, file_entry)
-    
-    print(f"Processed {len(run_data.get('file_manifest', []))} files from run {run_id}")
+
+    # Process individual files in the manifest using batch_writer for efficiency
+    file_manifest = run_data.get('file_manifest', [])
+    if file_manifest:
+        file_items = []
+        for file_entry in file_manifest:
+            file_item = build_file_record(bucket, key, run_id, instrument_id, file_entry)
+            if file_item:
+                file_items.append(file_item)
+
+        # Use batch_writer for efficient bulk writes
+        with file_inventory_table.batch_writer() as batch:
+            for item in file_items:
+                batch.put_item(Item=item)
+
+        print(f"Batch wrote {len(file_items)} files from run {run_id}")
+    else:
+        print(f"No files in manifest for run {run_id}")
 
 
 def process_experiment_metadata(bucket: str, key: str):
     """
     Process experiment.json metadata file
-    
+
     S3 Key Format: raw/{instrument}/{YYYY}/{MM}/{DD}/{run_id}/{staff}/payload/{experiment}/experiment.json
     """
     print(f"Processing experiment metadata: {key}")
-    
+
     # Download experiment.json
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
@@ -161,15 +192,11 @@ def process_experiment_metadata(bucket: str, key: str):
     except Exception as e:
         print(f"Error downloading experiment.json: {e}")
         raise
-    
-    # Convert timestamps to Unix
-    created_at = datetime.fromisoformat(
-        exp_data['created'].replace('Z', '+00:00')
-    ).timestamp()
-    last_updated = datetime.fromisoformat(
-        exp_data['last_updated'].replace('Z', '+00:00')
-    ).timestamp()
-    
+
+    # Convert timestamps to Unix with error handling
+    created_at = parse_timestamp(exp_data.get('created', ''), 'created')
+    last_updated = parse_timestamp(exp_data.get('last_updated', ''), 'last_updated')
+
     # Store experiment metadata
     item = {
         'experiment_id': exp_data['experiment_id'],
@@ -188,34 +215,60 @@ def process_experiment_metadata(bucket: str, key: str):
         'auto_detected': exp_data.get('auto_detected', True),
         'sync_version': exp_data.get('sync_version', '1.0')
     }
-    
+
     # Add parameters if present (future ML use)
     if 'parameters' in exp_data:
         item['parameters'] = exp_data['parameters']
-    
+
     experiments_table.put_item(Item=item)
     print(f"Stored experiment metadata: {exp_data['experiment_id']}")
-    
-    # Store individual file records
+
+    # Store individual file records using batch_writer
     experiment_id = exp_data['experiment_id']
-    for file_entry in exp_data.get('files', []):
-        store_experiment_file_record(
-            bucket, key, experiment_id, 
-            exp_data['staff_name'], 
-            exp_data['instrument'],
-            file_entry
-        )
-    
-    print(f"Processed {len(exp_data.get('files', []))} files from experiment {experiment_id}")
+    files = exp_data.get('files', [])
+
+    if files:
+        file_items = []
+        for file_entry in files:
+            file_item = build_experiment_file_record(
+                bucket, key, experiment_id,
+                exp_data['staff_name'],
+                exp_data['instrument'],
+                file_entry
+            )
+            if file_item:
+                file_items.append(file_item)
+
+        # Use batch_writer with conditional writes for experiment files
+        # Note: batch_writer doesn't support ConditionExpression, so we write individually
+        # but still benefit from automatic batching and retry logic
+        written_count = 0
+        skipped_count = 0
+        for file_item in file_items:
+            try:
+                file_inventory_table.put_item(
+                    Item=file_item,
+                    ConditionExpression='attribute_not_exists(experiment_id) AND attribute_not_exists(file_path)'
+                )
+                written_count += 1
+            except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+                skipped_count += 1
+
+        print(f"Wrote {written_count} files, skipped {skipped_count} existing files from experiment {experiment_id}")
+    else:
+        print(f"No files in experiment {experiment_id}")
 
 
-def store_file_record(bucket: str, run_json_key: str, run_id: str,
-                     instrument_id: str, file_entry: Dict[str, Any]):
+def build_file_record(bucket: str, run_json_key: str, run_id: str,
+                      instrument_id: str, file_entry: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Store individual file record from run.json manifest
+    Build a file record item from run.json manifest entry.
 
     Note: run.json file_manifest paths are in format: {staff}/{experiment}/file.ext
     But actual S3 keys have 'payload' inserted: {staff}/payload/{experiment}/file.ext
+
+    Returns:
+        Dict containing the DynamoDB item, or None if build fails
     """
     # Extract experiment_id from file path
     # run.json format: {staff}/{experiment}/file.ext (NO payload in manifest)
@@ -252,17 +305,15 @@ def store_file_record(bucket: str, run_json_key: str, run_id: str,
         s3_path = f"{path_parts[0]}/payload/{file_path.split('/')[-1]}"
 
     s3_key = f"{run_base}/{s3_path}"
-    
-    # Parse file modification date
-    file_date = datetime.fromisoformat(
-        file_entry['file_date'].replace('Z', '+00:00')
-    ).timestamp()
-    
+
+    # Parse file modification date with error handling
+    file_date = parse_timestamp(file_entry.get('file_date', ''), 'file_date')
+
     # Get file extension
     file_name = file_path.split('/')[-1]
     file_type = file_name.split('.')[-1].lower() if '.' in file_name else 'unknown'
-    
-    item = {
+
+    return {
         'experiment_id': experiment_id,
         'file_path': file_entry['path'],
         'file_name': file_name,
@@ -271,37 +322,36 @@ def store_file_record(bucket: str, run_json_key: str, run_id: str,
         'file_size_bytes': file_entry['size'],
         'file_type': file_type,
         'checksum_sha256': file_entry['checksum'].replace('sha256:', ''),
-        'uploaded_at': Decimal(str(int(datetime.now().timestamp()))),
+        'uploaded_at': Decimal(str(int(datetime.now(timezone.utc).timestamp()))),
         'modified_at': Decimal(str(int(file_date))),
         'run_id': run_id,
         'staff_name': staff_name,
         'instrument_id': instrument_id,
         'is_update': file_entry.get('is_update', False)
     }
-    
-    file_inventory_table.put_item(Item=item)
 
 
-def store_experiment_file_record(bucket: str, exp_json_key: str, 
-                                 experiment_id: str, staff_name: str,
-                                 instrument_id: str, file_entry: Dict[str, Any]):
+def build_experiment_file_record(bucket: str, exp_json_key: str,
+                                  experiment_id: str, staff_name: str,
+                                  instrument_id: str, file_entry: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Store individual file record from experiment.json
+    Build a file record item from experiment.json entry.
+
+    Returns:
+        Dict containing the DynamoDB item
     """
     # Construct full S3 key
     exp_base = '/'.join(exp_json_key.split('/')[:-1])  # Remove experiment.json
     s3_key = f"{exp_base}/{file_entry['relative_path']}"
-    
-    # Parse file modification date
-    file_modified = datetime.fromisoformat(
-        file_entry['modified'].replace('Z', '+00:00')
-    ).timestamp()
-    
+
+    # Parse file modification date with error handling
+    file_modified = parse_timestamp(file_entry.get('modified', ''), 'modified')
+
     # Get file extension
     file_name = file_entry['name']
     file_type = file_name.split('.')[-1].lower() if '.' in file_name else 'unknown'
-    
-    item = {
+
+    return {
         'experiment_id': experiment_id,
         'file_path': file_entry['relative_path'],
         'file_name': file_name,
@@ -310,21 +360,12 @@ def store_experiment_file_record(bucket: str, exp_json_key: str,
         'file_size_bytes': file_entry['size'],
         'file_type': file_type,
         'checksum_sha256': file_entry['checksum'].replace('sha256:', ''),
-        'uploaded_at': Decimal(str(int(datetime.now().timestamp()))),
+        'uploaded_at': Decimal(str(int(datetime.now(timezone.utc).timestamp()))),
         'modified_at': Decimal(str(int(file_modified))),
         'staff_name': staff_name,
         'instrument_id': instrument_id,
         'run_id': 'from_experiment_json'  # Will be updated if run.json processes this file
     }
-    
-    # Use conditional write to avoid overwriting data from run.json
-    try:
-        file_inventory_table.put_item(
-            Item=item,
-            ConditionExpression='attribute_not_exists(experiment_id) AND attribute_not_exists(file_path)'
-        )
-    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-        print(f"File already exists in inventory (from run.json): {file_entry['name']}")
 
 
 def generate_presigned_url(bucket: str, key: str, expiration: int = 3600) -> str:

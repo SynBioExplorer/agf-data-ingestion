@@ -252,6 +252,85 @@ fi
 echo ""
 
 # =============================================================================
+# PHASE 5b: Deploy Monitoring Alarms
+# =============================================================================
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "PHASE 5b: Deploying Monitoring Alarms"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+MONITORING_STACK="agf-monitoring-${ENVIRONMENT}"
+
+aws cloudformation deploy \
+    --template-file ../cloudformation/agf-monitoring-alarms.yaml \
+    --stack-name ${MONITORING_STACK} \
+    --parameter-overrides \
+        EnvironmentName=${ENVIRONMENT} \
+        AlertEmail=felix.meier@mq.edu.au \
+        LambdaFunctionName=${LAMBDA_FUNCTION} \
+    --region ${AWS_REGION}
+
+echo ""
+echo "✓ Monitoring alarms deployed"
+echo "  📧 Check your email for SNS subscription confirmation"
+echo ""
+
+# =============================================================================
+# PHASE 5c: Deploy Reconciliation Lambda
+# =============================================================================
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "PHASE 5c: Deploying Reconciliation Lambda"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+RECONCILIATION_STACK="agf-reconciliation-${ENVIRONMENT}"
+
+# Get SNS Topic ARN from monitoring stack
+SNS_TOPIC_ARN=$(aws cloudformation describe-stacks \
+    --stack-name ${MONITORING_STACK} \
+    --query "Stacks[0].Outputs[?OutputKey=='AlertsTopicArn'].OutputValue" \
+    --output text --region ${AWS_REGION} 2>/dev/null || echo "")
+
+aws cloudformation deploy \
+    --template-file ../cloudformation/agf-reconciliation-stack.yaml \
+    --stack-name ${RECONCILIATION_STACK} \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --parameter-overrides \
+        EnvironmentName=${ENVIRONMENT} \
+        AlertEmail=felix.meier@mq.edu.au \
+        DataBucketName=${S3_BUCKET} \
+        AlertsTopicArn="${SNS_TOPIC_ARN}" \
+    --region ${AWS_REGION}
+
+# Get Reconciliation Lambda function name
+RECONCILIATION_LAMBDA=$(aws cloudformation describe-stacks \
+    --stack-name ${RECONCILIATION_STACK} \
+    --query "Stacks[0].Outputs[?OutputKey=='ReconciliationLambdaName'].OutputValue" \
+    --output text --region ${AWS_REGION})
+
+# Package and update reconciliation Lambda code
+echo "Packaging Reconciliation Lambda..."
+rm -f reconciliation_deployment.zip 2>/dev/null || true
+cp ../lambda/agf_reconciliation_lambda.py lambda_package/index.py
+cd lambda_package
+zip -q -r ../reconciliation_deployment.zip .
+cd ..
+
+aws s3 cp reconciliation_deployment.zip s3://${DEPLOYMENT_BUCKET}/lambda/agf-reconciliation-${ENVIRONMENT}.zip
+
+aws lambda update-function-code \
+    --function-name ${RECONCILIATION_LAMBDA} \
+    --s3-bucket ${DEPLOYMENT_BUCKET} \
+    --s3-key lambda/agf-reconciliation-${ENVIRONMENT}.zip \
+    --region ${AWS_REGION} \
+    > /dev/null
+
+echo ""
+echo "✓ Reconciliation Lambda deployed: ${RECONCILIATION_LAMBDA}"
+echo "  📅 Runs weekly on Sundays at 2 AM AEST"
+echo ""
+
+# =============================================================================
 # PHASE 6: Verify Deployment
 # =============================================================================
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -301,6 +380,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "📋 Deployment Summary:"
 echo "  DynamoDB Stack: ${DYNAMODB_STACK}"
+echo "  Lambda Stack: ${LAMBDA_STACK}"
+echo "  Monitoring Stack: ${MONITORING_STACK}"
+echo "  Reconciliation Stack: ${RECONCILIATION_STACK}"
 echo "  Lambda Function: ${LAMBDA_FUNCTION}"
 echo "  S3 Bucket: ${S3_BUCKET}"
 echo "  Region: ${AWS_REGION}"
