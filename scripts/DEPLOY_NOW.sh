@@ -14,8 +14,26 @@ echo ""
 ENVIRONMENT="dev"
 AWS_REGION="ap-southeast-2"
 S3_BUCKET="agf-instrument-data"
+ALERT_EMAIL="${ALERT_EMAIL:-felix.meier@mq.edu.au}"
 DYNAMODB_STACK="agf-dynamodb-stack-${ENVIRONMENT}"
 LAMBDA_STACK="agf-lambda-stack-${ENVIRONMENT}"
+
+echo "Checking prerequisites..."
+echo ""
+
+# Check Python 3
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Python 3 is required but not installed"
+    exit 1
+fi
+echo "✓ Python 3 found"
+
+# Check boto3
+if ! python3 -c "import boto3" 2>/dev/null; then
+    echo "❌ boto3 is required. Install with: pip install boto3"
+    exit 1
+fi
+echo "✓ boto3 found"
 
 # Check AWS CLI
 if ! command -v aws &> /dev/null; then
@@ -266,7 +284,7 @@ aws cloudformation deploy \
     --stack-name ${MONITORING_STACK} \
     --parameter-overrides \
         EnvironmentName=${ENVIRONMENT} \
-        AlertEmail=felix.meier@mq.edu.au \
+        AlertEmail=${ALERT_EMAIL} \
         LambdaFunctionName=${LAMBDA_FUNCTION} \
     --region ${AWS_REGION}
 
@@ -297,7 +315,7 @@ aws cloudformation deploy \
     --capabilities CAPABILITY_NAMED_IAM \
     --parameter-overrides \
         EnvironmentName=${ENVIRONMENT} \
-        AlertEmail=felix.meier@mq.edu.au \
+        AlertEmail=${ALERT_EMAIL} \
         DataBucketName=${S3_BUCKET} \
         AlertsTopicArn="${SNS_TOPIC_ARN}" \
     --region ${AWS_REGION}

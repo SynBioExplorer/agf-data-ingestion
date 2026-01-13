@@ -66,6 +66,10 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-file-inventory-${EnvironmentName}'
                   - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-file-inventory-${EnvironmentName}/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-sync-runs-${EnvironmentName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-sync-runs-${EnvironmentName}/index/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-experiments-${EnvironmentName}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/agf-experiments-${EnvironmentName}/index/*'
         - PolicyName: SNSPublishAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -73,7 +77,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - sns:Publish
-                Resource: '*'
+                Resource: !Ref AlertsTopicArn
         - PolicyName: SESAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -81,7 +85,18 @@ Resources:
               - Effect: Allow
                 Action:
                   - ses:SendEmail
+                Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${AlertEmail}'
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
                 Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: 'AGF/Reconciliation'
       Tags:
         - Key: Project
           Value: AGF-Data-Infrastructure
@@ -104,6 +119,8 @@ Resources:
       Environment:
         Variables:
           FILE_INVENTORY_TABLE: !Sub 'agf-file-inventory-${EnvironmentName}'
+          SYNC_RUNS_TABLE: !Sub 'agf-sync-runs-${EnvironmentName}'
+          EXPERIMENTS_TABLE: !Sub 'agf-experiments-${EnvironmentName}'
           DATA_BUCKET: !Ref DataBucketName
           ALERT_EMAIL: !Ref AlertEmail
           SNS_TOPIC_ARN: !Ref AlertsTopicArn

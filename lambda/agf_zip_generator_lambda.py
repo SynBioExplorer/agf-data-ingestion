@@ -22,6 +22,10 @@ s3 = boto3.client('s3')
 BUCKET = os.environ.get('S3_BUCKET', 'agf-instrument-data')
 ZIP_PREFIX = 'downloads/zips/'
 
+# Size limits
+MAX_TOTAL_SIZE_BYTES = 5 * 1024 * 1024 * 1024  # 5GB limit
+MAX_SINGLE_FILE_BYTES = 1 * 1024 * 1024 * 1024  # 1GB per file
+
 
 def lambda_handler(event, context):
     """
@@ -51,46 +55,66 @@ def lambda_handler(event, context):
 
         print(f"Creating zip with {len(keys)} files: {zip_name}")
 
+        # Pre-validate all files (size check and accessibility)
+        total_size = 0
+        for s3_key in keys:
+            try:
+                head = s3.head_object(Bucket=BUCKET, Key=s3_key)
+                file_size = head['ContentLength']
+
+                if file_size > MAX_SINGLE_FILE_BYTES:
+                    return {
+                        'statusCode': 400,
+                        'error': f'File too large: {s3_key} ({file_size / 1024 / 1024:.1f}MB > {MAX_SINGLE_FILE_BYTES / 1024 / 1024}MB limit)'
+                    }
+
+                total_size += file_size
+            except Exception as e:
+                return {'statusCode': 400, 'error': f'Cannot access file {s3_key}: {e}'}
+
+        if total_size > MAX_TOTAL_SIZE_BYTES:
+            return {
+                'statusCode': 400,
+                'error': f'Total size {total_size / 1024 / 1024 / 1024:.1f}GB exceeds {MAX_TOTAL_SIZE_BYTES / 1024 / 1024 / 1024}GB limit'
+            }
+
+        print(f"Pre-validation passed. Total size: {total_size / 1024 / 1024:.1f}MB")
+
         # Create zip in memory
         zip_buffer = io.BytesIO()
         files_added = 0
-        errors = []
+        existing_names = set()  # O(1) lookup for duplicate detection
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for s3_key in keys:
+                print(f"Fetching: {s3_key}")
+
+                # Fail-fast: any error fails the entire batch
                 try:
-                    print(f"Fetching: {s3_key}")
                     response = s3.get_object(Bucket=BUCKET, Key=s3_key)
                     file_content = response['Body'].read()
-
-                    # Extract filename from S3 key
-                    filename = s3_key.split('/')[-1]
-
-                    # Handle duplicate filenames by adding a suffix
-                    existing_names = [info.filename for info in zf.filelist]
-                    if filename in existing_names:
-                        base, ext = os.path.splitext(filename)
-                        counter = 1
-                        while f"{base}_{counter}{ext}" in existing_names:
-                            counter += 1
-                        filename = f"{base}_{counter}{ext}"
-
-                    zf.writestr(filename, file_content)
-                    files_added += 1
-                    print(f"Added to zip: {filename}")
-
                 except Exception as e:
-                    error_msg = f"Error fetching {s3_key}: {str(e)}"
-                    print(error_msg)
-                    errors.append(error_msg)
-                    continue
+                    return {
+                        'statusCode': 500,
+                        'error': f'Failed to fetch {s3_key}: {str(e)}',
+                        'message': 'Batch cancelled - no partial downloads. Please retry or contact admin.'
+                    }
 
-        if files_added == 0:
-            return {
-                'statusCode': 400,
-                'error': 'No files could be added to zip',
-                'details': errors
-            }
+                # Extract filename from S3 key
+                filename = s3_key.split('/')[-1]
+
+                # O(1) duplicate filename resolution
+                if filename in existing_names:
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    while f"{base}_{counter}{ext}" in existing_names:
+                        counter += 1
+                    filename = f"{base}_{counter}{ext}"
+
+                existing_names.add(filename)
+                zf.writestr(filename, file_content)
+                files_added += 1
+                print(f"Added to zip: {filename}")
 
         # Generate unique zip filename with timestamp
         timestamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
@@ -120,8 +144,7 @@ def lambda_handler(event, context):
             'statusCode': 200,
             'zipKey': zip_key,
             'fileCount': files_added,
-            'zipSize': zip_size,
-            'errors': errors if errors else None
+            'zipSize': zip_size
         }
 
     except Exception as e:

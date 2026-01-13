@@ -80,6 +80,35 @@ Resources:
                         Fn::ImportValue: !Sub '${DynamoDBStackName}-SyncRunsTableArn'
 
   # ============================================================================
+  # Dead Letter Queue for EventBridge failed invocations
+  # ============================================================================
+  EventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'agf-eventbridge-dlq-${EnvironmentName}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: AGF-Data-Infrastructure
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Allow EventBridge to send messages to the DLQ
+  EventBridgeDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventBridgeDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDLQ.Arn
+
+  # ============================================================================
   # Lambda Function
   # ============================================================================
   IngestionLambdaFunction:
@@ -100,6 +129,7 @@ Resources:
           SYNC_RUNS_TABLE:
             Fn::ImportValue: !Sub '${DynamoDBStackName}-SyncRunsTable'
           ENVIRONMENT: !Ref EnvironmentName
+      ReservedConcurrentExecutions: 50  # Headroom for 31 instruments
       Code:
         ZipFile: |
           # Placeholder - will be replaced with actual code
@@ -136,6 +166,8 @@ Resources:
       Targets:
         - Arn: !GetAtt IngestionLambdaFunction.Arn
           Id: IngestionLambdaTarget
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
 
   # ============================================================================
   # EventBridge Rule for experiment.json files
@@ -161,6 +193,8 @@ Resources:
       Targets:
         - Arn: !GetAtt IngestionLambdaFunction.Arn
           Id: IngestionLambdaTarget
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
 
   # ============================================================================
   # Lambda Permissions for EventBridge
@@ -272,3 +306,15 @@ Outputs:
     Value: !Ref ZipGeneratorLambdaFunction
     Export:
       Name: !Sub '${AWS::StackName}-ZipGeneratorLambdaName'
+
+  EventBridgeDLQArn:
+    Description: ARN of the EventBridge Dead Letter Queue
+    Value: !GetAtt EventBridgeDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeDLQArn'
+
+  EventBridgeDLQUrl:
+    Description: URL of the EventBridge Dead Letter Queue
+    Value: !Ref EventBridgeDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeDLQUrl'

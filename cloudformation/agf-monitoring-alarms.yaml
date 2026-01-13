@@ -76,7 +76,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub 'AGF-Lambda-Duration-${EnvironmentName}'
-      AlarmDescription: 'Triggered when Lambda execution time approaches timeout (>250s of 300s limit)'
+      AlarmDescription: 'Triggered when Lambda execution time approaches timeout (>270s of 300s limit)'
       Namespace: 'AWS/Lambda'
       MetricName: 'Duration'
       Dimensions:
@@ -85,7 +85,7 @@ Resources:
       Statistic: Maximum
       Period: 300  # 5 minutes
       EvaluationPeriods: 1
-      Threshold: 250000  # 250 seconds in milliseconds
+      Threshold: 270000  # 270 seconds in milliseconds (30s buffer before 300s timeout)
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:

@@ -12,11 +12,31 @@ Version: 1.0
 import boto3
 import argparse
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from datetime import datetime
 
 s3 = boto3.client('s3')
 lambda_client = boto3.client('lambda')
+
+
+def retry_with_backoff(max_retries=3, base_delay=1):
+    """Decorator for exponential backoff retry"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  Retry {attempt + 1}/{max_retries} after {delay}s: {e}")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
 
 
 def find_json_files(bucket: str, prefix: str = 'raw/') -> list:
@@ -62,10 +82,11 @@ def create_s3_event(bucket: str, key: str) -> dict:
     }
 
 
+@retry_with_backoff(max_retries=3, base_delay=1)
 def invoke_lambda_for_file(lambda_function: str, bucket: str, key: str) -> dict:
     """Invoke Lambda function with S3 event for a single file"""
     event = create_s3_event(bucket, key)
-    
+
     try:
         response = lambda_client.invoke(
             FunctionName=lambda_function,
@@ -105,8 +126,12 @@ def backfill_parallel(lambda_function: str, bucket: str, files: list,
         
         # Process completed tasks
         for i, future in enumerate(as_completed(futures), 1):
-            result = future.result()
-            
+            try:
+                result = future.result(timeout=300)  # 5 minute timeout
+            except TimeoutError:
+                file_info = futures[future]
+                result = {'key': file_info['key'], 'status': 'error', 'error': 'Timeout after 300s'}
+
             if result['status'] == 'success':
                 results['success'] += 1
                 print(f"  [{i}/{len(files)}] ✓ {result['key']}")

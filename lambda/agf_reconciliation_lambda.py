@@ -25,6 +25,7 @@ s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 ses = boto3.client('ses')
 sns = boto3.client('sns')
+cloudwatch = boto3.client('cloudwatch')
 
 # Environment variables
 FILE_INVENTORY_TABLE = os.environ.get('FILE_INVENTORY_TABLE', 'agf-file-inventory-dev')
@@ -243,11 +244,30 @@ def generate_report(s3_keys: Set[str], dynamodb_keys: Set[str],
     return "\n".join(report_lines)
 
 
+def publish_notification_metric(success: bool):
+    """
+    Publish CloudWatch metric for notification success/failure.
+    """
+    try:
+        cloudwatch.put_metric_data(
+            Namespace='AGF/Reconciliation',
+            MetricData=[{
+                'MetricName': 'NotificationSuccess' if success else 'NotificationFailure',
+                'Value': 1,
+                'Unit': 'Count'
+            }]
+        )
+    except Exception as e:
+        print(f"WARNING: Failed to publish CloudWatch metric: {e}")
+
+
 def send_notification(report: str, orphaned_in_s3: Set[str], orphaned_in_db: Set[str]):
     """
     Send email notification with reconciliation report.
+    Publishes CloudWatch metrics for notification success/failure.
     """
     subject = f"[AGF] S3-DynamoDB Reconciliation: {len(orphaned_in_s3) + len(orphaned_in_db)} discrepancies found"
+    notification_sent = False
 
     if SNS_TOPIC_ARN:
         try:
@@ -257,24 +277,31 @@ def send_notification(report: str, orphaned_in_s3: Set[str], orphaned_in_db: Set
                 Message=report
             )
             print(f"Notification sent via SNS to {SNS_TOPIC_ARN}")
-            return
+            notification_sent = True
         except Exception as e:
             print(f"Failed to send SNS notification: {e}")
 
-    # Fallback: Try SES
-    try:
-        ses.send_email(
-            Source=ALERT_EMAIL,
-            Destination={'ToAddresses': [ALERT_EMAIL]},
-            Message={
-                'Subject': {'Data': subject},
-                'Body': {'Text': {'Data': report}}
-            }
-        )
-        print(f"Notification sent via SES to {ALERT_EMAIL}")
-    except Exception as e:
-        print(f"Failed to send SES notification: {e}")
-        print(f"Report:\n{report}")
+    # Fallback: Try SES if SNS failed or not configured
+    if not notification_sent:
+        try:
+            ses.send_email(
+                Source=ALERT_EMAIL,
+                Destination={'ToAddresses': [ALERT_EMAIL]},
+                Message={
+                    'Subject': {'Data': subject},
+                    'Body': {'Text': {'Data': report}}
+                }
+            )
+            print(f"Notification sent via SES to {ALERT_EMAIL}")
+            notification_sent = True
+        except Exception as e:
+            print(f"Failed to send SES notification: {e}")
+            print(f"Report:\n{report}")
+
+    # Publish CloudWatch metric
+    publish_notification_metric(notification_sent)
+
+    return notification_sent
 
 
 def send_error_notification(error_message: str):

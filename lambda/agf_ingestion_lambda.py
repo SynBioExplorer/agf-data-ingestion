@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 from typing import Dict, List, Any
 from decimal import Decimal
+from botocore.exceptions import ClientError
 
 # Initialize AWS clients
 s3 = boto3.client('s3')
@@ -25,6 +26,13 @@ FILE_INVENTORY_TABLE = os.environ['FILE_INVENTORY_TABLE']
 EXPERIMENTS_TABLE = os.environ['EXPERIMENTS_TABLE']
 SYNC_RUNS_TABLE = os.environ['SYNC_RUNS_TABLE']
 
+# Configuration for timestamp parsing strictness (default: lenient for quirky instruments)
+STRICT_TIMESTAMP_PARSING = os.environ.get('STRICT_TIMESTAMP_PARSING', 'false').lower() == 'true'
+
+# Regex for SHA256 checksum validation
+import re
+SHA256_PATTERN = re.compile(r'^[a-fA-F0-9]{64}$')
+
 # Initialize table references
 file_inventory_table = dynamodb.Table(FILE_INVENTORY_TABLE)
 experiments_table = dynamodb.Table(EXPERIMENTS_TABLE)
@@ -33,8 +41,8 @@ sync_runs_table = dynamodb.Table(SYNC_RUNS_TABLE)
 
 def parse_timestamp(timestamp_str: str, field_name: str = "timestamp") -> float:
     """
-    Safely parse ISO 8601 timestamp string to Unix timestamp.
-    Falls back to current time if parsing fails.
+    Parse ISO 8601 timestamp string to Unix timestamp.
+    Behavior controlled by STRICT_TIMESTAMP_PARSING env var.
 
     Args:
         timestamp_str: ISO 8601 formatted timestamp string
@@ -43,13 +51,65 @@ def parse_timestamp(timestamp_str: str, field_name: str = "timestamp") -> float:
     Returns:
         Unix timestamp as float
     """
+    if not timestamp_str:
+        if STRICT_TIMESTAMP_PARSING:
+            raise ValueError(f"{field_name} is empty or None")
+        print(f"WARNING: {field_name} is empty, using current time")
+        return datetime.now(timezone.utc).timestamp()
+
     try:
         # Handle 'Z' suffix for UTC
         normalized = timestamp_str.replace('Z', '+00:00')
         return datetime.fromisoformat(normalized).timestamp()
     except (ValueError, AttributeError, TypeError) as e:
+        if STRICT_TIMESTAMP_PARSING:
+            raise ValueError(f"Failed to parse {field_name} '{timestamp_str}': {e}")
         print(f"WARNING: Failed to parse {field_name} '{timestamp_str}': {e}. Using current time.")
         return datetime.now(timezone.utc).timestamp()
+
+
+def validate_s3_path(key: str) -> bool:
+    """
+    Basic validation that S3 key has expected structure.
+    Lenient to handle variations from different instruments.
+
+    Expected format: raw/{instrument}/{YYYY}/{MM}/{DD}/{run_id}/...
+    """
+    if not key.startswith('raw/'):
+        raise ValueError(f"S3 key must start with 'raw/': {key}")
+
+    parts = key.split('/')
+    if len(parts) < 6:
+        raise ValueError(f"S3 key too short, expected at least 6 segments: {key}")
+
+    # Check for date-like segments (YYYY/MM/DD)
+    try:
+        year, month, day = parts[2], parts[3], parts[4]
+        if not (year.isdigit() and month.isdigit() and day.isdigit()):
+            raise ValueError(f"Expected date segments (YYYY/MM/DD) at positions 2-4: {key}")
+    except IndexError:
+        raise ValueError(f"Missing date segments in path: {key}")
+
+    return True
+
+
+def validate_checksum(checksum: str) -> str:
+    """
+    Validate and normalize SHA256 checksum.
+
+    Args:
+        checksum: SHA256 checksum, optionally prefixed with 'sha256:'
+
+    Returns:
+        Normalized lowercase checksum (64 hex characters)
+    """
+    # Remove 'sha256:' prefix if present
+    clean = checksum.replace('sha256:', '').strip()
+
+    if not SHA256_PATTERN.match(clean):
+        raise ValueError(f"Invalid SHA256 checksum format: {checksum}")
+
+    return clean.lower()
 
 
 def lambda_handler(event, context):
@@ -84,6 +144,13 @@ def lambda_handler(event, context):
             key = unquote_plus(record['s3']['object']['key'])
 
             print(f"Processing: s3://{bucket}/{key}")
+
+            # Validate S3 path structure
+            try:
+                validate_s3_path(key)
+            except ValueError as e:
+                print(f"WARNING: Skipping invalid path: {e}")
+                continue
 
             # Route to appropriate handler based on file type
             if key.endswith('run.json'):
@@ -155,8 +222,17 @@ def process_run_metadata(bucket: str, key: str):
         'processed_at': Decimal(str(int(datetime.now(timezone.utc).timestamp())))
     }
 
-    sync_runs_table.put_item(Item=item)
-    print(f"Stored run metadata: {run_id}")
+    try:
+        sync_runs_table.put_item(
+            Item=item,
+            ConditionExpression='attribute_not_exists(run_id) AND attribute_not_exists(instrument_id)'
+        )
+        print(f"Stored run metadata: {run_id}")
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        print(f"Run {run_id} already exists, skipping (idempotent)")
+    except ClientError as e:
+        print(f"ERROR: DynamoDB write failed for run {run_id}: {e}")
+        raise
 
     # Process individual files in the manifest using batch_writer for efficiency
     file_manifest = run_data.get('file_manifest', [])
@@ -220,8 +296,17 @@ def process_experiment_metadata(bucket: str, key: str):
     if 'parameters' in exp_data:
         item['parameters'] = exp_data['parameters']
 
-    experiments_table.put_item(Item=item)
-    print(f"Stored experiment metadata: {exp_data['experiment_id']}")
+    try:
+        experiments_table.put_item(
+            Item=item,
+            ConditionExpression='attribute_not_exists(experiment_id) AND attribute_not_exists(last_updated)'
+        )
+        print(f"Stored experiment metadata: {exp_data['experiment_id']}")
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        print(f"Experiment {exp_data['experiment_id']} already exists, skipping (idempotent)")
+    except ClientError as e:
+        print(f"ERROR: DynamoDB write failed for experiment {exp_data['experiment_id']}: {e}")
+        raise
 
     # Store individual file records using batch_writer
     experiment_id = exp_data['experiment_id']
@@ -321,7 +406,7 @@ def build_file_record(bucket: str, run_json_key: str, run_id: str,
         's3_bucket': bucket,
         'file_size_bytes': file_entry['size'],
         'file_type': file_type,
-        'checksum_sha256': file_entry['checksum'].replace('sha256:', ''),
+        'checksum_sha256': validate_checksum(file_entry['checksum']),
         'uploaded_at': Decimal(str(int(datetime.now(timezone.utc).timestamp()))),
         'modified_at': Decimal(str(int(file_date))),
         'run_id': run_id,
@@ -359,7 +444,7 @@ def build_experiment_file_record(bucket: str, exp_json_key: str,
         's3_bucket': bucket,
         'file_size_bytes': file_entry['size'],
         'file_type': file_type,
-        'checksum_sha256': file_entry['checksum'].replace('sha256:', ''),
+        'checksum_sha256': validate_checksum(file_entry['checksum']),
         'uploaded_at': Decimal(str(int(datetime.now(timezone.utc).timestamp()))),
         'modified_at': Decimal(str(int(file_modified))),
         'staff_name': staff_name,
