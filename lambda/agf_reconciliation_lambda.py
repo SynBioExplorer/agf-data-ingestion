@@ -17,7 +17,7 @@ Version: 1.1
 import json
 import boto3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Set
 
 # Initialize AWS clients
@@ -34,6 +34,10 @@ EXPERIMENTS_TABLE = os.environ.get('EXPERIMENTS_TABLE', 'agf-experiments-dev')
 DATA_BUCKET = os.environ.get('DATA_BUCKET', 'agf-instrument-data')
 ALERT_EMAIL = os.environ.get('ALERT_EMAIL', 'felix.meier@mq.edu.au')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
+
+# Incremental reconciliation: only check files modified within this window
+# Default 8 days covers weekly runs with 1-day buffer for safety
+RECONCILIATION_DAYS = int(os.environ.get('RECONCILIATION_DAYS', '8'))
 
 # Initialize table references
 file_inventory_table = dynamodb.Table(FILE_INVENTORY_TABLE)
@@ -94,62 +98,86 @@ def lambda_handler(event, context):
 
 def get_s3_keys() -> Set[str]:
     """
-    Get all file keys from S3 bucket.
+    Get file keys from S3 bucket modified within the reconciliation window.
     Uses pagination to handle large buckets.
 
-    Excludes only:
-    - Folders (ending with /)
-    - macOS artifacts (.DS_Store)
+    Filters:
+    - Only files modified in last RECONCILIATION_DAYS (default 8 days)
+    - Excludes folders (ending with /)
+    - Excludes macOS artifacts (.DS_Store)
+
+    This incremental approach prevents timeout issues at scale (50k+ files).
     """
     keys = set()
     paginator = s3.get_paginator('list_objects_v2')
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RECONCILIATION_DAYS)
+
+    print(f"Checking S3 files modified since {cutoff.isoformat()} ({RECONCILIATION_DAYS} day window)")
 
     for page in paginator.paginate(Bucket=DATA_BUCKET, Prefix='raw/'):
         for obj in page.get('Contents', []):
-            key = obj['Key']
-            if not key.endswith('/') and '.DS_Store' not in key:
-                keys.add(key)
+            # Only include files modified within the reconciliation window
+            if obj['LastModified'] >= cutoff:
+                key = obj['Key']
+                if not key.endswith('/') and '.DS_Store' not in key:
+                    keys.add(key)
 
     return keys
 
 
 def get_all_dynamodb_keys() -> Set[str]:
     """
-    Get all tracked S3 keys from ALL relevant DynamoDB tables.
+    Get tracked S3 keys from ALL relevant DynamoDB tables, filtered by timestamp.
+
+    Only retrieves records processed within the reconciliation window to match
+    the S3 incremental check and prevent timeout at scale.
 
     Combines keys from:
-    - agf-file-inventory: s3_key field (data files)
-    - agf-sync-runs: s3_key field (run.json files)
-    - agf-experiments: s3_experiment_json_key field (experiment.json files)
+    - agf-file-inventory: s3_key field (data files) - filtered by uploaded_at
+    - agf-sync-runs: s3_key field (run.json files) - filtered by processed_at
+    - agf-experiments: s3_experiment_json_key field (experiment.json files) - filtered by last_updated
     """
     all_keys = set()
+    cutoff_timestamp = int((datetime.now(timezone.utc) - timedelta(days=RECONCILIATION_DAYS)).timestamp())
 
-    # 1. File inventory table (data files)
-    file_keys = scan_table_for_keys(file_inventory_table, 's3_key')
+    print(f"Checking DynamoDB records processed since timestamp {cutoff_timestamp} ({RECONCILIATION_DAYS} day window)")
+
+    # 1. File inventory table (data files) - uses uploaded_at timestamp
+    file_keys = scan_table_for_keys_with_filter(
+        file_inventory_table, 's3_key', 'uploaded_at', cutoff_timestamp
+    )
     print(f"  - agf-file-inventory: {len(file_keys)} keys")
     all_keys.update(file_keys)
 
-    # 2. Sync runs table (run.json files)
-    run_keys = scan_table_for_keys(sync_runs_table, 's3_key')
+    # 2. Sync runs table (run.json files) - uses processed_at timestamp
+    run_keys = scan_table_for_keys_with_filter(
+        sync_runs_table, 's3_key', 'processed_at', cutoff_timestamp
+    )
     print(f"  - agf-sync-runs: {len(run_keys)} keys")
     all_keys.update(run_keys)
 
-    # 3. Experiments table (experiment.json files)
-    exp_keys = scan_table_for_keys(experiments_table, 's3_experiment_json_key')
+    # 3. Experiments table (experiment.json files) - uses last_updated timestamp
+    exp_keys = scan_table_for_keys_with_filter(
+        experiments_table, 's3_experiment_json_key', 'last_updated', cutoff_timestamp
+    )
     print(f"  - agf-experiments: {len(exp_keys)} keys")
     all_keys.update(exp_keys)
 
     return all_keys
 
 
-def scan_table_for_keys(table, key_attribute: str) -> Set[str]:
+def scan_table_for_keys_with_filter(table, key_attribute: str, timestamp_attribute: str, cutoff_timestamp: int) -> Set[str]:
     """
-    Scan a DynamoDB table and extract all values of the specified key attribute.
+    Scan a DynamoDB table and extract values of the specified key attribute,
+    filtered to only include records with timestamp >= cutoff.
+
     Uses pagination to handle large tables.
     """
     keys = set()
     scan_kwargs = {
-        'ProjectionExpression': key_attribute,
+        'ProjectionExpression': f'{key_attribute}, {timestamp_attribute}',
+        'FilterExpression': f'{timestamp_attribute} >= :cutoff',
+        'ExpressionAttributeValues': {':cutoff': cutoff_timestamp}
     }
 
     done = False
