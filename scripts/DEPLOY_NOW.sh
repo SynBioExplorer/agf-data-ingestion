@@ -64,7 +64,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 aws cloudformation deploy \
-    --template-file agf-dynamodb-tables.yaml \
+    --template-file ../../storage/dynamodb/cloudformation/agf-dynamodb-tables.yaml \
     --stack-name ${DYNAMODB_STACK} \
     --parameter-overrides EnvironmentName=${ENVIRONMENT} \
     --region ${AWS_REGION} \
@@ -97,13 +97,14 @@ echo "PHASE 2: Populating Instrument Registry"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-if [ ! -f "Instrument_Inventory.csv" ]; then
-    echo "❌ Instrument_Inventory.csv not found in current directory"
-    echo "Please copy it here and re-run"
+INSTRUMENT_CSV="../../storage/dynamodb/data/Instrument_Inventory.csv"
+if [ ! -f "$INSTRUMENT_CSV" ]; then
+    echo "❌ Instrument_Inventory.csv not found at $INSTRUMENT_CSV"
+    echo "Please ensure the file exists"
     exit 1
 fi
 
-python3 populate_instruments.py --environment ${ENVIRONMENT} --csv Instrument_Inventory.csv
+python3 ../../storage/dynamodb/scripts/populate_instruments.py --environment ${ENVIRONMENT} --csv "$INSTRUMENT_CSV"
 
 echo ""
 echo "✓ 31 instruments populated"
@@ -121,7 +122,7 @@ echo ""
 echo "Packaging Lambda function..."
 rm -rf lambda_package lambda_deployment.zip 2>/dev/null || true
 mkdir -p lambda_package
-cp agf_ingestion_lambda.py lambda_package/index.py
+cp ../lambda/agf_ingestion_lambda.py lambda_package/index.py
 cd lambda_package
 zip -q -r ../lambda_deployment.zip .
 cd ..
@@ -142,7 +143,7 @@ echo "✓ Lambda package uploaded"
 # Deploy Lambda stack
 echo "Deploying Lambda stack..."
 aws cloudformation deploy \
-    --template-file agf-lambda-stack.yaml \
+    --template-file ../lambda/cloudformation/agf-lambda-stack.yaml \
     --stack-name ${LAMBDA_STACK} \
     --parameter-overrides \
         EnvironmentName=${ENVIRONMENT} \
@@ -181,7 +182,7 @@ echo ""
 # Package Zip Generator Lambda
 echo "Packaging Zip Generator Lambda..."
 rm -f zip_generator_deployment.zip 2>/dev/null || true
-cp agf_zip_generator_lambda.py lambda_package/index.py
+cp ../lambda/agf_zip_generator_lambda.py lambda_package/index.py
 cd lambda_package
 zip -q -r ../zip_generator_deployment.zip .
 cd ..
