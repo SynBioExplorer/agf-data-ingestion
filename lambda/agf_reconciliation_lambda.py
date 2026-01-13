@@ -5,18 +5,20 @@ Triggered weekly by CloudWatch Events to compare S3 inventory with DynamoDB reco
 Identifies orphaned files (in S3 but not in DynamoDB) and sends email notification
 with actionable options.
 
+Checks ALL relevant DynamoDB tables:
+- agf-file-inventory: tracks data files (via s3_key)
+- agf-sync-runs: tracks run.json files (via s3_key)
+- agf-experiments: tracks experiment.json files (via s3_experiment_json_key)
+
 Author: Felix Meier
-Version: 1.0
+Version: 1.1
 """
 
 import json
 import boto3
 import os
-import csv
-import gzip
 from datetime import datetime, timezone
-from typing import Dict, List, Set, Tuple
-from io import StringIO, BytesIO
+from typing import Set
 
 # Initialize AWS clients
 s3 = boto3.client('s3')
@@ -26,35 +28,37 @@ sns = boto3.client('sns')
 
 # Environment variables
 FILE_INVENTORY_TABLE = os.environ.get('FILE_INVENTORY_TABLE', 'agf-file-inventory-dev')
+SYNC_RUNS_TABLE = os.environ.get('SYNC_RUNS_TABLE', 'agf-sync-runs-dev')
+EXPERIMENTS_TABLE = os.environ.get('EXPERIMENTS_TABLE', 'agf-experiments-dev')
 DATA_BUCKET = os.environ.get('DATA_BUCKET', 'agf-instrument-data')
-INVENTORY_BUCKET = os.environ.get('INVENTORY_BUCKET', 'agf-instrument-data')
 ALERT_EMAIL = os.environ.get('ALERT_EMAIL', 'felix.meier@mq.edu.au')
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
-BACKFILL_LAMBDA_ARN = os.environ.get('BACKFILL_LAMBDA_ARN', '')
 
-# Initialize table reference
+# Initialize table references
 file_inventory_table = dynamodb.Table(FILE_INVENTORY_TABLE)
+sync_runs_table = dynamodb.Table(SYNC_RUNS_TABLE)
+experiments_table = dynamodb.Table(EXPERIMENTS_TABLE)
 
 
 def lambda_handler(event, context):
     """
-    Main handler function triggered by CloudWatch Events (weekly schedule)
-    or S3 Inventory completion notification.
+    Main handler function triggered by CloudWatch Events (weekly schedule).
+    Compares S3 files against ALL DynamoDB tables to find orphans.
     """
     print(f"Starting S3-DynamoDB reconciliation at {datetime.now(timezone.utc).isoformat()}")
 
     try:
-        # Get S3 keys from inventory or direct listing
-        s3_keys = get_s3_data_keys()
-        print(f"Found {len(s3_keys)} data files in S3")
+        # Get ALL S3 keys (excluding only folders and .DS_Store)
+        s3_keys = get_s3_keys()
+        print(f"Found {len(s3_keys)} files in S3")
 
-        # Get DynamoDB s3_key values
-        dynamodb_keys = get_dynamodb_s3_keys()
-        print(f"Found {len(dynamodb_keys)} file records in DynamoDB")
+        # Get tracked keys from ALL DynamoDB tables
+        dynamodb_keys = get_all_dynamodb_keys()
+        print(f"Found {len(dynamodb_keys)} tracked files in DynamoDB (across all tables)")
 
         # Find discrepancies
-        orphaned_in_s3 = s3_keys - dynamodb_keys  # Files in S3 but not in DynamoDB
-        orphaned_in_db = dynamodb_keys - s3_keys  # Records in DynamoDB but file missing from S3
+        orphaned_in_s3 = s3_keys - dynamodb_keys  # Files in S3 but not tracked anywhere
+        orphaned_in_db = dynamodb_keys - s3_keys  # Records pointing to non-existent files
 
         print(f"Orphaned in S3 (no DB record): {len(orphaned_in_s3)}")
         print(f"Orphaned in DB (no S3 file): {len(orphaned_in_db)}")
@@ -87,35 +91,64 @@ def lambda_handler(event, context):
         raise
 
 
-def get_s3_data_keys() -> Set[str]:
+def get_s3_keys() -> Set[str]:
     """
-    Get all data file keys from S3 bucket (excluding .json metadata files).
+    Get all file keys from S3 bucket.
     Uses pagination to handle large buckets.
+
+    Excludes only:
+    - Folders (ending with /)
+    - macOS artifacts (.DS_Store)
     """
     keys = set()
     paginator = s3.get_paginator('list_objects_v2')
 
-    # Only look in raw/ prefix where instrument data is stored
     for page in paginator.paginate(Bucket=DATA_BUCKET, Prefix='raw/'):
         for obj in page.get('Contents', []):
             key = obj['Key']
-            # Exclude metadata files and folders
-            if not key.endswith('/') and not key.endswith('.json'):
+            if not key.endswith('/') and '.DS_Store' not in key:
                 keys.add(key)
 
     return keys
 
 
-def get_dynamodb_s3_keys() -> Set[str]:
+def get_all_dynamodb_keys() -> Set[str]:
     """
-    Get all s3_key values from DynamoDB file inventory table.
+    Get all tracked S3 keys from ALL relevant DynamoDB tables.
+
+    Combines keys from:
+    - agf-file-inventory: s3_key field (data files)
+    - agf-sync-runs: s3_key field (run.json files)
+    - agf-experiments: s3_experiment_json_key field (experiment.json files)
+    """
+    all_keys = set()
+
+    # 1. File inventory table (data files)
+    file_keys = scan_table_for_keys(file_inventory_table, 's3_key')
+    print(f"  - agf-file-inventory: {len(file_keys)} keys")
+    all_keys.update(file_keys)
+
+    # 2. Sync runs table (run.json files)
+    run_keys = scan_table_for_keys(sync_runs_table, 's3_key')
+    print(f"  - agf-sync-runs: {len(run_keys)} keys")
+    all_keys.update(run_keys)
+
+    # 3. Experiments table (experiment.json files)
+    exp_keys = scan_table_for_keys(experiments_table, 's3_experiment_json_key')
+    print(f"  - agf-experiments: {len(exp_keys)} keys")
+    all_keys.update(exp_keys)
+
+    return all_keys
+
+
+def scan_table_for_keys(table, key_attribute: str) -> Set[str]:
+    """
+    Scan a DynamoDB table and extract all values of the specified key attribute.
     Uses pagination to handle large tables.
     """
     keys = set()
-
-    # Scan the table to get all s3_key values
     scan_kwargs = {
-        'ProjectionExpression': 's3_key',
+        'ProjectionExpression': key_attribute,
     }
 
     done = False
@@ -125,12 +158,12 @@ def get_dynamodb_s3_keys() -> Set[str]:
         if start_key:
             scan_kwargs['ExclusiveStartKey'] = start_key
 
-        response = file_inventory_table.scan(**scan_kwargs)
+        response = table.scan(**scan_kwargs)
         items = response.get('Items', [])
 
         for item in items:
-            if 's3_key' in item:
-                keys.add(item['s3_key'])
+            if key_attribute in item:
+                keys.add(item[key_attribute])
 
         start_key = response.get('LastEvaluatedKey')
         done = start_key is None
@@ -151,20 +184,20 @@ def generate_report(s3_keys: Set[str], dynamodb_keys: Set[str],
         "",
         "SUMMARY",
         "-" * 40,
-        f"Total files in S3:        {len(s3_keys):,}",
-        f"Total records in DynamoDB: {len(dynamodb_keys):,}",
+        f"Total files in S3:          {len(s3_keys):,}",
+        f"Total tracked in DynamoDB:  {len(dynamodb_keys):,}",
         "",
-        f"Orphaned in S3 (no DB record):    {len(orphaned_in_s3):,}",
-        f"Orphaned in DB (no S3 file):      {len(orphaned_in_db):,}",
+        f"Orphaned in S3 (untracked): {len(orphaned_in_s3):,}",
+        f"Orphaned in DB (missing):   {len(orphaned_in_db):,}",
         "",
     ]
 
     if orphaned_in_s3:
         report_lines.extend([
-            "FILES IN S3 WITHOUT DYNAMODB RECORD (sample, max 20):",
+            "FILES IN S3 NOT TRACKED IN ANY DYNAMODB TABLE (sample, max 20):",
             "-" * 40,
         ])
-        for key in list(orphaned_in_s3)[:20]:
+        for key in sorted(orphaned_in_s3)[:20]:
             report_lines.append(f"  - {key}")
         if len(orphaned_in_s3) > 20:
             report_lines.append(f"  ... and {len(orphaned_in_s3) - 20} more")
@@ -172,10 +205,10 @@ def generate_report(s3_keys: Set[str], dynamodb_keys: Set[str],
 
     if orphaned_in_db:
         report_lines.extend([
-            "DYNAMODB RECORDS WITHOUT S3 FILE (sample, max 20):",
+            "DYNAMODB RECORDS POINTING TO MISSING S3 FILES (sample, max 20):",
             "-" * 40,
         ])
-        for key in list(orphaned_in_db)[:20]:
+        for key in sorted(orphaned_in_db)[:20]:
             report_lines.append(f"  - {key}")
         if len(orphaned_in_db) > 20:
             report_lines.append(f"  ... and {len(orphaned_in_db) - 20} more")
@@ -189,18 +222,18 @@ def generate_report(s3_keys: Set[str], dynamodb_keys: Set[str],
     if orphaned_in_s3:
         report_lines.extend([
             "",
-            "For files in S3 without DynamoDB records:",
+            "For untracked S3 files:",
             "  Option 1: Run backfill script to process these files",
             "            python3 scripts/backfill_s3_data.py --bucket agf-instrument-data",
-            "  Option 2: Investigate why metadata wasn't created",
+            "  Option 2: Delete if they are test/junk files",
             "",
         ])
 
     if orphaned_in_db:
         report_lines.extend([
             "",
-            "For DynamoDB records without S3 files:",
-            "  Option 1: Delete orphaned DynamoDB records (if S3 files were intentionally removed)",
+            "For orphaned DynamoDB records:",
+            "  Option 1: Delete orphaned records (if S3 files were intentionally removed)",
             "  Option 2: Investigate - S3 files should be immutable",
             "",
         ])
@@ -216,12 +249,11 @@ def send_notification(report: str, orphaned_in_s3: Set[str], orphaned_in_db: Set
     """
     subject = f"[AGF] S3-DynamoDB Reconciliation: {len(orphaned_in_s3) + len(orphaned_in_db)} discrepancies found"
 
-    # Try SNS first, fall back to SES
     if SNS_TOPIC_ARN:
         try:
             sns.publish(
                 TopicArn=SNS_TOPIC_ARN,
-                Subject=subject[:100],  # SNS subject limit
+                Subject=subject[:100],
                 Message=report
             )
             print(f"Notification sent via SNS to {SNS_TOPIC_ARN}")
