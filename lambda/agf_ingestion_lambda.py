@@ -210,6 +210,7 @@ def process_run_metadata(bucket: str, key: str):
     item = {
         'run_id': run_id,
         'instrument_id': instrument_id,
+        'gsi_pk': 'ALL',  # Fixed partition key for cross-instrument GSI queries
         'computer_name': run_data['computer_name'],
         'sync_timestamp': Decimal(str(int(sync_timestamp))),
         'date': f"{year}-{month}-{day}",
