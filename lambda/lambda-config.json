@@ -35,6 +35,25 @@
       "sourceFile": "agf_zip_generator_lambda.py"
     },
     {
+      "functionName": "agf-reconciliation-dev",
+      "description": "Weekly S3-DynamoDB reconciliation for AGF data pipeline",
+      "runtime": "python3.11",
+      "handler": "agf_reconciliation_lambda.lambda_handler",
+      "memorySize": 512,
+      "timeout": 900,
+      "role": "agf-reconciliation-lambda-role-dev",
+      "environment": {
+        "FILE_INVENTORY_TABLE": "agf-file-inventory-dev",
+        "EXPERIMENTS_TABLE": "agf-experiments-dev",
+        "SYNC_RUNS_TABLE": "agf-sync-runs-dev",
+        "DATA_BUCKET": "agf-instrument-data",
+        "SNS_TOPIC_ARN": "arn:aws:sns:ap-southeast-2:789922127765:agf-pipeline-alerts-dev",
+        "ALERT_EMAIL": "felix.meier@mq.edu.au"
+      },
+      "sourceFile": "agf_reconciliation_lambda.py",
+      "triggers": ["agf-reconciliation-schedule-dev"]
+    },
+    {
       "functionName": "AGF-CognitoPostConfirmation",
       "description": "Post-confirmation trigger for Cognito user pool",
       "runtime": "nodejs22.x",

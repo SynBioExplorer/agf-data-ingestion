@@ -1,0 +1,17 @@
+{
+  "topics": [
+    {
+      "topicName": "agf-pipeline-alerts-dev",
+      "topicArn": "arn:aws:sns:ap-southeast-2:789922127765:agf-pipeline-alerts-dev",
+      "displayName": "AGF Pipeline Alerts",
+      "description": "SNS topic for AGF data pipeline alerts and notifications from reconciliation Lambda",
+      "subscriptions": [
+        {
+          "protocol": "email",
+          "endpoint": "felix.meier@mq.edu.au",
+          "status": "confirmed"
+        }
+      ]
+    }
+  ]
+}

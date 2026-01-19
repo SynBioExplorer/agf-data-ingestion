@@ -47,6 +47,19 @@
           "Arn": "arn:aws:lambda:ap-southeast-2:789922127765:function:agf-data-ingestion-dev"
         }
       ]
+    },
+    {
+      "Name": "agf-reconciliation-schedule-dev",
+      "Description": "Triggers weekly S3-DynamoDB reconciliation every Sunday at 2 AM AEST",
+      "State": "ENABLED",
+      "EventBusName": "default",
+      "ScheduleExpression": "cron(0 16 ? * SUN *)",
+      "Targets": [
+        {
+          "Id": "ReconciliationLambdaTarget",
+          "Arn": "arn:aws:lambda:ap-southeast-2:789922127765:function:agf-reconciliation-dev"
+        }
+      ]
     }
   ]
 }
